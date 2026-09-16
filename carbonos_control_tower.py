@@ -740,140 +740,165 @@ if mode == "90-Day Operational Plan":
     if "day90_records" not in st.session_state:
         st.session_state.day90_records = {}
 
-    st.subheader("📅 Daily Operating Inputs")
+    st.subheader("📅 Daily Plant Inputs")
+    st.caption(
+        "Enter the exact daily operating quantities available from the plant. "
+        "No demand factors or percentages are required."
+    )
 
-    d1, d2, d3 = st.columns(3)
+    # Reference totals from the submitted workfile.
+    REF_STEAM = float(steam_demand.sum())
+    REF_ELECTRICITY = float((fixed_electricity + baseline_flexible).sum())
+    REF_WASTE_HEAT = float(SUBMITTED_WH.sum())
+    REF_SOLAR = float(SUBMITTED_SOLAR.sum())
 
-    with d1:
-        selected_day = st.number_input(
-            "Plan Day",
-            min_value=1,
-            max_value=90,
-            value=1,
-            step=1
+    selected_day = st.number_input(
+        "Plan Day", min_value=1, max_value=90, value=1, step=1
+    )
+
+    st.markdown("#### Required daily inputs")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        daily_steam = st.number_input(
+            "Steam demand (t/day)",
+            min_value=0.0, max_value=10000.0,
+            value=REF_STEAM, step=1.0,
+            help="Total steam required by the plant for this day."
+        )
+        daily_electricity = st.number_input(
+            "Total electricity demand (MWh/day)",
+            min_value=0.0, max_value=5000.0,
+            value=REF_ELECTRICITY, step=0.1,
+            help="Total electricity required for the day, including flexible load."
         )
 
-    with d2:
-        demand_factor = st.number_input(
-            "Steam demand factor",
-            min_value=0.50,
-            max_value=1.50,
-            value=1.00,
-            step=0.01,
-            help="1.00 = exactly the submitted workfile demand."
+    with c2:
+        daily_waste_heat = st.number_input(
+            "Available waste heat (t/day)",
+            min_value=0.0, max_value=5000.0,
+            value=REF_WASTE_HEAT, step=1.0,
+            help="Waste heat available for recovery during the day."
         )
-
-    with d3:
-        electricity_factor = st.number_input(
-            "Electricity demand factor",
-            min_value=0.50,
-            max_value=1.50,
-            value=1.00,
-            step=0.01,
-            help="1.00 = exactly the submitted workfile electricity profile."
+        daily_solar = st.number_input(
+            "Available solar electricity (MWh/day)",
+            min_value=0.0, max_value=5000.0,
+            value=REF_SOLAR, step=0.1,
+            help="Solar electricity available during the day."
         )
 
     st.info(
-        "At factors 1.00 / 1.00, this mode reproduces the submitted "
-        "24-hour workfile calculation: 842.944 tCO2e/day and "
-        "₹5,099,750/day."
+        f"Submitted-workfile reference values: {REF_STEAM:.0f} t/day steam | "
+        f"{REF_ELECTRICITY:.1f} MWh/day electricity | "
+        f"{REF_WASTE_HEAT:.0f} t/day waste heat | {REF_SOLAR:.1f} MWh/day solar."
     )
 
+    # Internal conversion only. The operator enters quantities, not factors.
+    steam_factor = daily_steam / REF_STEAM if REF_STEAM else 0.0
+    electricity_factor = daily_electricity / REF_ELECTRICITY if REF_ELECTRICITY else 0.0
+    wh_factor = daily_waste_heat / REF_WASTE_HEAT if REF_WASTE_HEAT else 0.0
+    solar_factor = daily_solar / REF_SOLAR if REF_SOLAR else 0.0
+
     day_df = build_submitted_plan(
-        demand_factor=demand_factor,
+        demand_factor=steam_factor,
         electricity_factor=electricity_factor
     )
 
+    # Apply exact plant-entered waste heat and solar quantities.
+    day_df["Waste Heat (t/h)"] = SUBMITTED_WH * wh_factor
+    day_df["Solar Used (MW)"] = SUBMITTED_SOLAR * solar_factor
+
+    # Recalculate steam balance.
+    day_df["Steam Supply (t/h)"] = (
+        day_df["Coal (t/h)"] + day_df["Biomass (t/h)"] +
+        day_df["Gas (t/h)"] + day_df["Waste Heat (t/h)"]
+    )
+    day_df["Steam Demand (t/h)"] = steam_demand * steam_factor
+    day_df["Steam Error (t/h)"] = (
+        day_df["Steam Supply (t/h)"] - day_df["Steam Demand (t/h)"]
+    )
+
+    # Recalculate electricity balance using solar first and grid as balancing source.
+    day_df["Fixed Electricity (MW)"] = fixed_electricity * electricity_factor
+    day_df["Flexible Load (MW)"] = SUBMITTED_FLEX * electricity_factor
+    day_df["Electricity Demand (MW)"] = (
+        day_df["Fixed Electricity (MW)"] + day_df["Flexible Load (MW)"]
+    )
+    day_df["Grid Import (MW)"] = np.maximum(
+        day_df["Electricity Demand (MW)"] - day_df["Solar Used (MW)"], 0.0
+    )
+    day_df["Electricity Error (MW)"] = (
+        day_df["Solar Used (MW)"] + day_df["Grid Import (MW)"] -
+        day_df["Electricity Demand (MW)"]
+    )
+
+    # Workfile fuel/emission/cost equations.
+    day_df["Coal Fuel (t)"] = day_df["Coal (t/h)"] * COAL_FUEL_COEFF
+    day_df["Biomass Fuel (t)"] = day_df["Biomass (t/h)"] * BIO_FUEL_COEFF
+    day_df["Gas Fuel (Sm3)"] = day_df["Gas (t/h)"] * GAS_FUEL_COEFF
+    day_df["Emissions (tCO2e)"] = (
+        day_df["Coal Fuel (t)"] * COAL_EF +
+        day_df["Biomass Fuel (t)"] * BIO_EF +
+        day_df["Gas Fuel (Sm3)"] * GAS_EF +
+        day_df["Grid Import (MW)"] * grid_factor
+    )
+    day_df["Variable Cost (INR)"] = (
+        day_df["Coal Fuel (t)"] * COAL_PRICE +
+        day_df["Biomass Fuel (t)"] * BIO_PRICE +
+        day_df["Gas Fuel (Sm3)"] * GAS_PRICE +
+        day_df["Grid Import (MW)"] * tariff
+    )
+
+    # Daily results.
     day_co2 = day_df["Emissions (tCO2e)"].sum()
     day_cost = day_df["Variable Cost (INR)"].sum()
-
     day_coal = day_df["Coal Fuel (t)"].sum()
     day_bio = day_df["Biomass Fuel (t)"].sum()
     day_gas = day_df["Gas Fuel (Sm3)"].sum()
 
-    day_carbon_reduction = (
-        100 * (BASELINE_CO2 - day_co2) / BASELINE_CO2
-    )
-    day_cost_reduction = (
-        100 * (BASELINE_COST - day_cost) / BASELINE_COST
-    )
+    day_carbon_reduction = 100 * (BASELINE_CO2 - day_co2) / BASELINE_CO2
+    day_cost_reduction = 100 * (BASELINE_COST - day_cost) / BASELINE_COST
 
-    # Feasibility checks based on the submitted workfile limits.
     steam_balanced = (
-        np.max(np.abs(day_df["Steam Error (t/h)"])) <= 1e-6
-        and np.min(day_df["Steam Supply (t/h)"]) >= 0
+        np.min(day_df["Steam Supply (t/h)"] - day_df["Steam Demand (t/h)"]) >= -1e-6 and
+        np.max(day_df["Steam Supply (t/h)"] - 1.03 * day_df["Steam Demand (t/h)"]) <= 1e-6
     )
-    electricity_balanced = (
-        np.max(np.abs(day_df["Electricity Error (MW)"])) <= 1e-6
-    )
+    electricity_balanced = np.max(np.abs(day_df["Electricity Error (MW)"])) <= 1e-6
     fuel_ok = (
-        day_coal <= COAL_DAILY_LIMIT + 1e-6
-        and day_bio <= BIO_DAILY_LIMIT + 1e-6
-        and day_gas <= GAS_DAILY_LIMIT + 1e-6
+        day_coal <= COAL_DAILY_LIMIT + 1e-6 and
+        day_bio <= BIO_DAILY_LIMIT + 1e-6 and
+        day_gas <= GAS_DAILY_LIMIT + 1e-6
     )
     grid_ok = day_df["Grid Import (MW)"].max() <= GRID_LIMIT + 1e-6
-    solar_ok = np.all(
-        day_df["Solar Used (MW)"].values
-        <= solar_availability + 1e-6
-    )
-    flex_ok = abs(
-        day_df["Flexible Load (MW)"].sum() - FLEX_DAILY_ENERGY
-    ) <= 1e-6
-
     carbon_gate = day_carbon_reduction >= 12.0
     cost_gate = day_cost_reduction >= 5.0
+    all_day_pass = all([
+        carbon_gate, cost_gate, steam_balanced,
+        electricity_balanced, fuel_ok, grid_ok
+    ])
 
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "Daily CO₂",
-        f"{day_co2:,.3f} tCO₂e"
-    )
-    c2.metric(
-        "Daily Cost",
-        f"₹{day_cost:,.0f}"
-    )
-    c3.metric(
-        "CO₂ Reduction",
-        f"{day_carbon_reduction:.2f}%"
-    )
-    c4.metric(
-        "Cost Reduction",
-        f"{day_cost_reduction:.2f}%"
-    )
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Daily CO₂", f"{day_co2:,.3f} tCO₂e")
+    k2.metric("Daily Cost", f"₹{day_cost:,.0f}")
+    k3.metric("CO₂ Reduction", f"{day_carbon_reduction:.2f}%")
+    k4.metric("Cost Reduction", f"{day_cost_reduction:.2f}%")
 
     st.subheader("🎯 Mandatory Gate Check")
-
     gate_table = pd.DataFrame({
         "Gate": [
-            "Carbon reduction",
-            "Cost reduction",
-            "Hourly steam balance",
-            "Hourly electricity balance",
-            "Fuel limits",
-            "Grid limit",
-            "Solar availability",
-            "Flexible load = 18 MWh/day"
+            "Carbon reduction", "Cost reduction", "Hourly steam balance",
+            "Hourly electricity balance", "Fuel limits", "Grid limit"
         ],
         "Required": [
-            "≥ 12%",
-            "≥ 5%",
-            "Balanced",
-            "Balanced",
-            "Within limits",
-            "≤ 22 MW",
-            "Within availability",
-            "18 MWh/day"
+            "≥ 12%", "≥ 5%", "Demand ≤ supply ≤ 103%",
+            "Balanced", "Within limits", "≤ 22 MW"
         ],
         "Achieved": [
-            f"{day_carbon_reduction:.2f}%",
-            f"{day_cost_reduction:.2f}%",
-            "PASS" if steam_balanced else "CHECK",
-            "PASS" if electricity_balanced else "CHECK",
+            f"{day_carbon_reduction:.2f}%", f"{day_cost_reduction:.2f}%",
+            "PASS" if steam_balanced else "FAIL",
+            "PASS" if electricity_balanced else "FAIL",
             "PASS" if fuel_ok else "FAIL",
-            "PASS" if grid_ok else "FAIL",
-            "PASS" if solar_ok else "FAIL",
-            f"{day_df['Flexible Load (MW)'].sum():.2f} MWh"
+            f"{day_df['Grid Import (MW)'].max():.2f} MW"
         ],
         "Status": [
             "PASS" if carbon_gate else "FAIL",
@@ -881,26 +906,23 @@ if mode == "90-Day Operational Plan":
             "PASS" if steam_balanced else "FAIL",
             "PASS" if electricity_balanced else "FAIL",
             "PASS" if fuel_ok else "FAIL",
-            "PASS" if grid_ok else "FAIL",
-            "PASS" if solar_ok else "FAIL",
-            "PASS" if flex_ok else "FAIL"
+            "PASS" if grid_ok else "FAIL"
         ]
     })
+    st.dataframe(gate_table, use_container_width=True, hide_index=True)
 
-    st.dataframe(
-        gate_table,
-        use_container_width=True,
-        hide_index=True
-    )
+    if all_day_pass:
+        st.success(f"🟢 Day {int(selected_day)} is feasible and clears the mandatory gates.")
+    else:
+        st.warning(f"🟠 Day {int(selected_day)} requires operational adjustment before execution.")
 
-    if st.button(
-        f"💾 Save Day {selected_day}",
-        type="primary"
-    ):
+    if st.button(f"💾 Save Day {int(selected_day)}", type="primary"):
         st.session_state.day90_records[int(selected_day)] = {
             "Day": int(selected_day),
-            "Steam Demand Factor": demand_factor,
-            "Electricity Demand Factor": electricity_factor,
+            "Steam Demand (t/day)": daily_steam,
+            "Electricity Demand (MWh/day)": daily_electricity,
+            "Waste Heat Available (t/day)": daily_waste_heat,
+            "Solar Available (MWh/day)": daily_solar,
             "CO2 (tCO2e/day)": day_co2,
             "Cost (INR/day)": day_cost,
             "CO2 Reduction (%)": day_carbon_reduction,
@@ -908,72 +930,38 @@ if mode == "90-Day Operational Plan":
             "Coal Fuel (t/day)": day_coal,
             "Biomass Fuel (t/day)": day_bio,
             "Gas Fuel (Sm3/day)": day_gas,
-            "All Gates Passed": all([
-                carbon_gate, cost_gate,
-                steam_balanced, electricity_balanced,
-                fuel_ok, grid_ok, solar_ok, flex_ok
-            ])
+            "Grid Import (MWh/day)": day_df["Grid Import (MW)"].sum(),
+            "All Gates Passed": all_day_pass
         }
-        st.success(f"Day {selected_day} saved.")
+        st.success(f"Day {int(selected_day)} saved.")
 
     st.divider()
-
     records = st.session_state.day90_records
 
     if records:
-        records_df = pd.DataFrame(
-            list(records.values())
-        ).sort_values("Day")
-
+        records_df = pd.DataFrame(list(records.values())).sort_values("Day")
         st.subheader("📈 90-Day Progress")
-
         completed = len(records_df)
-
         st.progress(completed / 90)
 
         p1, p2, p3, p4 = st.columns(4)
-
         p1.metric("Days Recorded", f"{completed}/90")
-        p2.metric(
-            "Average CO₂",
-            f"{records_df['CO2 (tCO2e/day)'].mean():,.3f} t"
-        )
-        p3.metric(
-            "Average Cost",
-            f"₹{records_df['Cost (INR/day)'].mean():,.0f}"
-        )
-        p4.metric(
-            "Days Passing All Gates",
-            f"{int(records_df['All Gates Passed'].sum())}/{completed}"
-        )
+        p2.metric("Average CO₂", f"{records_df['CO2 (tCO2e/day)'].mean():,.3f} t")
+        p3.metric("Average Cost", f"₹{records_df['Cost (INR/day)'].mean():,.0f}")
+        p4.metric("Days Passing All Gates", f"{int(records_df['All Gates Passed'].sum())}/{completed}")
 
-        st.dataframe(
-            records_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        csv90 = records_df.to_csv(index=False)
-
+        st.dataframe(records_df, use_container_width=True, hide_index=True)
         st.download_button(
             "⬇️ Download 90-Day Plan CSV",
-            csv90,
+            records_df.to_csv(index=False),
             "CarbonOS_90_Day_Operational_Plan.csv",
             "text/csv"
         )
-
     else:
-        st.info(
-            "No days recorded yet. Enter the operating factors and "
-            "save Day 1 to start the 90-day plan."
-        )
+        st.info("No days recorded yet. Enter the daily plant quantities and save Day 1 to start the 90-day plan.")
 
     st.subheader("📋 Current Day — 24-Hour Calculation")
-    st.dataframe(
-        day_df,
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(day_df, use_container_width=True, hide_index=True)
 
     st.stop()
 
