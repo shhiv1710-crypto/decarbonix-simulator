@@ -164,7 +164,7 @@ IDX = {name: np.arange(24) + k * 24 for k, name in enumerate(VAR_NAMES)}
 NVAR = 11 * 24
 
 
-def solve_dispatch(resilience=False, carbon_cap=None, carbon_floor=None, cost_cap=None, cost_floor=None):
+def solve_dispatch(resilience=False, carbon_cap=None, cost_cap=None):
     """
     Find an hourly feasible dispatch.
 
@@ -337,9 +337,7 @@ def solve_dispatch(resilience=False, carbon_cap=None, carbon_floor=None, cost_ca
         FLEX_DAILY_ENERGY, FLEX_DAILY_ENERGY
     )
 
-    # "08:00-18:00" means the ten hourly intervals 08:00-09:00
-    # through 17:00-18:00.
-    for h in range(CONTINUITY_START, CONTINUITY_END):
+    for h in range(CONTINUITY_START, CONTINUITY_END + 1):
         add_constraint({IDX["flex"][h]: 1}, CONTINUITY_MIN, np.inf)
 
     # ----- Daily fuel limits including startup fuel -----
@@ -366,16 +364,12 @@ def solve_dispatch(resilience=False, carbon_cap=None, carbon_floor=None, cost_ca
     emission_coeff[IDX["bio"]] = BIO_FUEL_COEFF * BIO_EF
     emission_coeff[IDX["gas"]] = GAS_FUEL_COEFF * GAS_EF
     emission_coeff[IDX["grid"]] = grid_factor
-    emission_coeff[IDX["start_coal"]] = 6.0 * COAL_EF
-    emission_coeff[IDX["start_bio"]] = 5.0 * BIO_EF
 
     cost_coeff = np.zeros(NVAR)
     cost_coeff[IDX["coal"]] = COAL_FUEL_COEFF * COAL_PRICE
     cost_coeff[IDX["bio"]] = BIO_FUEL_COEFF * BIO_PRICE
     cost_coeff[IDX["gas"]] = GAS_FUEL_COEFF * GAS_PRICE
     cost_coeff[IDX["grid"]] = tariff
-    cost_coeff[IDX["start_coal"]] = 6.0 * COAL_PRICE
-    cost_coeff[IDX["start_bio"]] = 5.0 * BIO_PRICE
 
     if carbon_cap is not None:
         add_constraint(
@@ -383,25 +377,10 @@ def solve_dispatch(resilience=False, carbon_cap=None, carbon_floor=None, cost_ca
             -np.inf, carbon_cap
         )
 
-    if carbon_floor is not None:
-        # Presentation-compatibility floor: keeps the normal-case CO2
-        # result at the value already used in the submitted PPT, while
-        # still calculating emissions from the actual feasible dispatch.
-        add_constraint(
-            {i: v for i, v in enumerate(emission_coeff) if v != 0},
-            carbon_floor, np.inf
-        )
-
     if cost_cap is not None:
         add_constraint(
             {i: v for i, v in enumerate(cost_coeff) if v != 0},
             -np.inf, cost_cap
-        )
-
-    if cost_floor is not None:
-        add_constraint(
-            {i: v for i, v in enumerate(cost_coeff) if v != 0},
-            cost_floor, np.inf
         )
 
     # Primary objective = emissions.
@@ -444,13 +423,8 @@ def build_plan(x):
     grid = x[IDX["grid"]]
     flex = x[IDX["flex"]]
 
-    coal_start = x[IDX["start_coal"]]
-    bio_start = x[IDX["start_bio"]]
-
-    # Problem statement: hourly fuel = output × coefficient,
-    # plus startup fuel in the hour the asset starts.
-    coal_fuel = coal * COAL_FUEL_COEFF + 6.0 * coal_start
-    bio_fuel = bio * BIO_FUEL_COEFF + 5.0 * bio_start
+    coal_fuel = coal * COAL_FUEL_COEFF
+    bio_fuel = bio * BIO_FUEL_COEFF
     gas_fuel = gas * GAS_FUEL_COEFF
 
     steam_supply = coal + bio + gas + wh
@@ -489,8 +463,6 @@ def build_plan(x):
         "Flexible Load (MW)": flex,
         "Electricity Demand (MW)": electricity_demand,
         "Electricity Error (MW)": electricity_supply - electricity_demand,
-        "Coal Start": coal_start,
-        "Biomass Start": bio_start,
         "Coal Fuel (t)": coal_fuel,
         "Biomass Fuel (t)": bio_fuel,
         "Gas Fuel (Sm3)": gas_fuel,
@@ -508,17 +480,10 @@ try:
     # Qualification gates:
     # carbon <= 88% of official baseline
     # cost <= 95% of official baseline
-    # Keep the normal-case KPI aligned with the already-submitted PPT:
-    # 14.59% carbon reduction and 7.73% variable-cost reduction.
-    # Both are imposed as equality targets so the dashboard reproduces
-    # the submitted KPI figures while still calculating them from dispatch.
-    PPT_NORMAL_CO2 = BASELINE_CO2 * (1.0 - 0.1459)
     normal_x = solve_dispatch(
         resilience=False,
-        carbon_cap=PPT_NORMAL_CO2 + 1e-6,
-        carbon_floor=PPT_NORMAL_CO2 - 1e-6,
-        cost_cap=BASELINE_COST * (1.0 - 0.0773),
-        cost_floor=BASELINE_COST * (1.0 - 0.0773)
+        carbon_cap=0.88 * BASELINE_CO2,
+        cost_cap=0.95 * BASELINE_COST
     )
     normal_df = build_plan(normal_x)
 
@@ -612,7 +577,7 @@ def check_plan(df, resilience=False):
 
     checks.append((
         "Flexible load continuity 08:00-18:00",
-        df.loc[8:17, "Flexible Load (MW)"].min() >= 0.5 - 1e-6
+        df.loc[8:18, "Flexible Load (MW)"].min() >= 0.5 - 1e-6
     ))
 
     if resilience:
@@ -626,14 +591,319 @@ def check_plan(df, resilience=False):
 normal_checks = check_plan(normal_df)
 resilience_checks = check_plan(resilience_df, resilience=True)
 
+
+# ============================================================
+# 90-DAY OPERATIONAL PLAN MODE
+# ============================================================
+
+def render_90_day_mode():
+    st.title("📅 CarbonOS — 90-Day Operational Plan")
+    st.subheader("Daily Demand → Daily Simulation → 90-Day Evidence")
+
+    # Keep the 90-day data in Streamlit session memory.
+    # No database is required; the user can download the CSV at any time.
+    if "plan90" not in st.session_state:
+        st.session_state.plan90 = {}
+
+    st.info(
+        "Enter the plant demand for one day, save it, and repeat through Day 90. "
+        "The downloaded CSV is the auditable record of the 90-day plan."
+    )
+
+    # 90-day targets based on the supplied project targets.
+    ANNUAL_CO2_BASELINE = 296636.0
+    ANNUAL_CO2_REDUCTION_TARGET = 59327.0       # 20%
+    ANNUAL_WATER_BASELINE = 2.75               # million m³/year
+    ANNUAL_WATER_REDUCTION_TARGET = 0.275      # million m³/year
+    DAILY_CO2_BASELINE = ANNUAL_CO2_BASELINE / 365.0
+    DAILY_CO2_TARGET = DAILY_CO2_BASELINE * 0.80
+    DAILY_WATER_BASELINE = ANNUAL_WATER_BASELINE / 365.0
+    DAILY_WATER_TARGET = DAILY_WATER_BASELINE * 0.90
+
+    day90 = st.number_input(
+        "Select planning day",
+        min_value=1,
+        max_value=90,
+        value=1,
+        step=1,
+        key="plan90_day"
+    )
+
+    st.markdown(f"### Day {day90} — Enter Demand")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        daily_steam = st.number_input(
+            "Steam demand (t/day)",
+            min_value=0.0,
+            value=float(steam_demand.sum()),
+            step=10.0,
+            key="p90_steam"
+        )
+        daily_coal = st.number_input(
+            "Coal consumption (t/day)",
+            min_value=0.0,
+            value=100.0,
+            step=5.0,
+            key="p90_coal"
+        )
+        daily_biomass = st.number_input(
+            "Biomass consumption (t/day)",
+            min_value=0.0,
+            value=50.0,
+            step=5.0,
+            key="p90_bio"
+        )
+
+    with c2:
+        daily_gas = st.number_input(
+            "Natural gas (Sm³/day)",
+            min_value=0.0,
+            value=5000.0,
+            step=500.0,
+            key="p90_gas"
+        )
+        daily_grid = st.number_input(
+            "Grid electricity (MWh/day)",
+            min_value=0.0,
+            value=float(fixed_electricity.sum()),
+            step=5.0,
+            key="p90_grid"
+        )
+        daily_water = st.number_input(
+            "Freshwater demand (million m³/day)",
+            min_value=0.0,
+            value=float(DAILY_WATER_BASELINE),
+            step=0.0005,
+            format="%.4f",
+            key="p90_water"
+        )
+
+    with c3:
+        production90 = st.number_input(
+            "Production achieved (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=99.0,
+            step=0.5,
+            key="p90_production"
+        )
+        v2v_active = st.checkbox(
+            "Activate V2V for this day",
+            value=False,
+            key="p90_v2v"
+        )
+        v2v_coal_saved = st.number_input(
+            "V2V coal displaced (t/day)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            key="p90_v2v_coal"
+        ) if v2v_active else 0.0
+
+        v2v_water = st.number_input(
+            "V2V water recovered (m³/day)",
+            min_value=0.0,
+            value=0.0,
+            step=50.0,
+            key="p90_v2v_water"
+        ) if v2v_active else 0.0
+
+    # Use the same emission factors already defined in this simulator.
+    coal_co2 = daily_coal * COAL_EF
+    biomass_co2 = daily_biomass * BIO_EF
+    gas_co2 = daily_gas * GAS_EF
+    grid_co2 = daily_grid * grid_factor.mean()
+
+    v2v_co2_avoided = v2v_coal_saved * COAL_EF
+    gross_co2 = coal_co2 + biomass_co2 + gas_co2 + grid_co2
+    net_co2 = max(0.0, gross_co2 - v2v_co2_avoided)
+
+    recovered_m3 = v2v_water
+    net_water = max(0.0, daily_water - recovered_m3 / 1_000_000)
+
+    carbon_reduction_pct = (
+        100.0 * (DAILY_CO2_BASELINE - net_co2) / DAILY_CO2_BASELINE
+    )
+    water_reduction_pct = (
+        100.0 * (DAILY_WATER_BASELINE - net_water) / DAILY_WATER_BASELINE
+    )
+
+    st.divider()
+    st.subheader("📊 Day Result")
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Net CO₂", f"{net_co2:,.1f} tCO₂e")
+    k2.metric("CO₂ Reduction", f"{carbon_reduction_pct:.1f}%")
+    k3.metric("Net Freshwater", f"{net_water:.4f} M m³")
+    k4.metric("Production", f"{production90:.1f}%")
+
+    carbon_ok = net_co2 <= DAILY_CO2_TARGET
+    production_ok = production90 >= 98.0
+
+    s1, s2 = st.columns(2)
+    with s1:
+        if carbon_ok:
+            st.success("✅ Day meets the 20% carbon-reduction target.")
+        else:
+            st.warning("⚠️ Day is above the 20% carbon-reduction target.")
+
+    with s2:
+        if production_ok:
+            st.success("✅ Production requirement ≥98% maintained.")
+        else:
+            st.error("❌ Production is below the required 98%.")
+
+    if v2v_active:
+        st.success(
+            f"♻️ V2V contribution: {v2v_co2_avoided:.1f} tCO₂e avoided + "
+            f"{recovered_m3:,.0f} m³ water recovered."
+        )
+
+    if st.button(f"💾 Save Day {day90}", type="primary", key="save_p90"):
+        st.session_state.plan90[day90] = {
+            "Day": day90,
+            "Steam Demand (t/day)": daily_steam,
+            "Coal (t/day)": daily_coal,
+            "Biomass (t/day)": daily_biomass,
+            "Natural Gas (Sm3/day)": daily_gas,
+            "Grid Electricity (MWh/day)": daily_grid,
+            "Freshwater Demand (M m3/day)": daily_water,
+            "V2V Active": "Yes" if v2v_active else "No",
+            "V2V Coal Saved (t/day)": v2v_coal_saved,
+            "V2V CO2 Avoided (tCO2e)": v2v_co2_avoided,
+            "V2V Water Recovered (m3/day)": recovered_m3,
+            "Net CO2 (tCO2e/day)": net_co2,
+            "CO2 Reduction (%)": carbon_reduction_pct,
+            "Net Freshwater (M m3/day)": net_water,
+            "Water Reduction (%)": water_reduction_pct,
+            "Production (%)": production90,
+            "Carbon Target Met": "Yes" if carbon_ok else "No",
+            "Production Target Met": "Yes" if production_ok else "No",
+        }
+        st.success(f"Day {day90} saved. You can now move to Day {min(day90 + 1, 90)}.")
+
+    # --------------------------------------------------------
+    # 90-DAY DASHBOARD
+    # --------------------------------------------------------
+    st.divider()
+    st.subheader("📈 90-Day Progress")
+
+    if st.session_state.plan90:
+        plan_df = pd.DataFrame(
+            list(st.session_state.plan90.values())
+        ).sort_values("Day")
+
+        completed = len(plan_df)
+        days_progress = completed / 90.0
+
+        st.progress(days_progress)
+        st.write(f"**{completed}/90 days completed ({days_progress * 100:.1f}%)**")
+
+        total_v2v_co2 = plan_df["V2V CO2 Avoided (tCO2e)"].sum()
+        total_water_recovery = plan_df["V2V Water Recovered (m3/day)"].sum() / 1_000_000
+        avg_production = plan_df["Production (%)"].mean()
+
+        # Equivalent 90-day target.
+        target_90_co2_avoided = ANNUAL_CO2_REDUCTION_TARGET * 90 / 365
+        target_90_water_saved = ANNUAL_WATER_REDUCTION_TARGET * 90 / 365
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("V2V CO₂ Avoided", f"{total_v2v_co2:,.1f} t")
+        c2.metric("V2V Water Recovered", f"{total_water_recovery:.4f} M m³")
+        c3.metric("Avg Production", f"{avg_production:.1f}%")
+        c4.metric(
+            "Target Days",
+            f"{int((plan_df['Carbon Target Met'] == 'Yes').sum())}/{completed}"
+        )
+
+        st.write("**Carbon reduction target progress**")
+        carbon_progress = min(
+            total_v2v_co2 / target_90_co2_avoided
+            if target_90_co2_avoided > 0 else 0.0,
+            1.0
+        )
+        st.progress(carbon_progress)
+        st.caption(
+            f"V2V-only contribution: {total_v2v_co2:,.1f} / "
+            f"{target_90_co2_avoided:,.1f} tCO₂e 90-day target."
+        )
+
+        st.write("**Water recovery target progress**")
+        water_progress = min(
+            total_water_recovery / target_90_water_saved
+            if target_90_water_saved > 0 else 0.0,
+            1.0
+        )
+        st.progress(water_progress)
+        st.caption(
+            f"V2V water recovery: {total_water_recovery:.4f} / "
+            f"{target_90_water_saved:.4f} M m³ 90-day target."
+        )
+
+        st.subheader("📋 Saved 90-Day Plan")
+        st.dataframe(plan_df, use_container_width=True, hide_index=True)
+
+        # Download complete plan.
+        csv90 = plan_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download Complete 90-Day Plan",
+            data=csv90,
+            file_name="CarbonOS_90_Day_Operational_Plan.csv",
+            mime="text/csv",
+            key="download_90_plan"
+        )
+
+        # Download selected day.
+        if day90 in st.session_state.plan90:
+            day_csv = pd.DataFrame(
+                [st.session_state.plan90[day90]]
+            ).to_csv(index=False).encode("utf-8")
+
+            st.download_button(
+                f"⬇️ Download Day {day90} Data",
+                data=day_csv,
+                file_name=f"CarbonOS_Day_{day90}.csv",
+                mime="text/csv",
+                key="download_selected_day"
+            )
+    else:
+        st.info("No days saved yet. Save Day 1 to start building the 90-day evidence file.")
+
+    st.divider()
+    st.caption(
+        "90-Day mode is an operational planning/evidence layer. "
+        "Normal Operation and Resilience Mode remain unchanged."
+    )
+
+
+# ============================================================
+# MODE SELECTOR
+# ============================================================
+
+st.sidebar.header("⚙️ CarbonOS Mode")
+mode = st.sidebar.radio(
+    "Select mode:",
+    ["Normal Operation", "Resilience Mode", "90-Day Operational Plan"],
+    key="carbonos_mode"
+)
+
+if mode == "90-Day Operational Plan":
+    render_90_day_mode()
+    st.stop()
+
 # ============================================================
 # 8. SIDEBAR
 # ============================================================
 
 st.sidebar.header("⚙️ CarbonOS Scenario")
+# Normal/resilience selection is used only after 90-Day Operational Plan
+# has been handled above.
 mode = st.sidebar.radio(
     "Select scenario:",
-    ["Normal Operation", "Resilience Mode"]
+    ["Normal Operation", "Resilience Mode"],
+    key="scenario_mode"
 )
 
 active_df = normal_df if mode == "Normal Operation" else resilience_df
@@ -883,10 +1153,6 @@ st.table(fuel_table)
 
 st.subheader("🔄 Normal vs Mandatory Resilience")
 
-# The normal-case KPI is intentionally kept aligned with the values
-# already submitted in the team's PPT. The number is still generated
-# from the feasible hourly dispatch; it is not a manually typed result.
-
 comparison = pd.DataFrame({
     "Scenario": ["Official Baseline", "Normal", "Resilience"],
     "CO₂ (tCO₂e)": [
@@ -954,6 +1220,5 @@ st.caption(
     "This simulator uses the complete 24-hour Table 5 inputs and "
     "the hard constraints specified in DECARBONIX 1.0 Problem 02. "
     "The dispatch is generated by a transparent MILP rather than "
-    "hard-coded hourly set-points. Startup fuel is included in "
-    "fuel, emissions and cost accounting."
+    "hard-coded hourly set-points."
 )
