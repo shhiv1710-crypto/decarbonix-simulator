@@ -109,7 +109,7 @@ FLEX_MAX = 2.5               # MW
 FLEX_START_HOUR = 6
 FLEX_END_HOUR = 23           # inclusive
 CONTINUITY_START = 8
-CONTINUITY_END = 18          # inclusive
+CONTINUITY_END = 17          # 17:00-18:00 is the final hourly interval
 CONTINUITY_MIN = 0.5         # MW
 
 # ============================================================
@@ -705,8 +705,8 @@ def check_plan(df, resilience=False):
     ))
 
     checks.append((
-        "Flexible load continuity 08:00-18:00",
-        df.loc[8:18, "Flexible Load (MW)"].min() >= 0.5 - 1e-6
+        "Flexible load continuity across 08:00-18:00 intervals",
+        df.loc[8:17, "Flexible Load (MW)"].min() >= 0.5 - 1e-6
     ))
 
     if resilience:
@@ -768,7 +768,7 @@ if mode == "90-Day Operational Plan":
         )
         daily_electricity = st.number_input(
             "Total electricity demand (MWh/day)",
-            min_value=0.0, max_value=5000.0,
+            min_value=18.0, max_value=5000.0,
             value=REF_ELECTRICITY, step=0.1,
             help="Total electricity required for the day, including flexible load."
         )
@@ -874,7 +874,9 @@ if mode == "90-Day Operational Plan":
     cost_gate = day_cost_reduction >= 5.0
     all_day_pass = all([
         carbon_gate, cost_gate, steam_balanced,
-        electricity_balanced, fuel_ok, grid_ok
+        electricity_balanced, fuel_ok, grid_ok,
+        day_df.loc[8:17, "Flexible Load (MW)"].min() >= 0.5 - 1e-6,
+        abs(day_df["Flexible Load (MW)"].sum() - 18.0) <= 1e-6
     ])
 
     k1, k2, k3, k4 = st.columns(4)
@@ -887,18 +889,21 @@ if mode == "90-Day Operational Plan":
     gate_table = pd.DataFrame({
         "Gate": [
             "Carbon reduction", "Cost reduction", "Hourly steam balance",
-            "Hourly electricity balance", "Fuel limits", "Grid limit"
+            "Hourly electricity balance", "Fuel limits", "Grid limit",
+            "Flexible load continuity 08:00-18:00", "Flexible load energy"
         ],
         "Required": [
             "≥ 12%", "≥ 5%", "Demand ≤ supply ≤ 103%",
-            "Balanced", "Within limits", "≤ 22 MW"
+            "Balanced", "Within limits", "≤ 22 MW", "≥ 0.5 MW in each hourly interval", "= 18 MWh/day"
         ],
         "Achieved": [
             f"{day_carbon_reduction:.2f}%", f"{day_cost_reduction:.2f}%",
             "PASS" if steam_balanced else "FAIL",
             "PASS" if electricity_balanced else "FAIL",
             "PASS" if fuel_ok else "FAIL",
-            f"{day_df['Grid Import (MW)'].max():.2f} MW"
+            f"{day_df['Grid Import (MW)'].max():.2f} MW",
+            f"{day_df.loc[8:17, 'Flexible Load (MW)'].min():.2f} MW min",
+            f"{day_df['Flexible Load (MW)'].sum():.2f} MWh"
         ],
         "Status": [
             "PASS" if carbon_gate else "FAIL",
@@ -906,7 +911,9 @@ if mode == "90-Day Operational Plan":
             "PASS" if steam_balanced else "FAIL",
             "PASS" if electricity_balanced else "FAIL",
             "PASS" if fuel_ok else "FAIL",
-            "PASS" if grid_ok else "FAIL"
+            "PASS" if grid_ok else "FAIL",
+            "PASS" if day_df.loc[8:17, "Flexible Load (MW)"].min() >= 0.5 - 1e-6 else "FAIL",
+            "PASS" if abs(day_df["Flexible Load (MW)"].sum() - 18.0) <= 1e-6 else "FAIL"
         ]
     })
     st.dataframe(gate_table, use_container_width=True, hide_index=True)
