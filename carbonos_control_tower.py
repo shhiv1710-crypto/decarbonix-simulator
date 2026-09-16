@@ -177,7 +177,7 @@ def solve_dispatch(resilience=False, carbon_cap=None, cost_cap=None):
       - coal/biomass min/max and ramp
       - coal/biomass minimum-on time
       - gas max/ramp
-      - solar availability
+      - solar used <= 80% of hourly solar availability
       - grid <= 22 MW
       - flexible load exactly 18 MWh/day
       - 0.5 MW continuity during 08:00-18:00
@@ -200,7 +200,7 @@ def solve_dispatch(resilience=False, carbon_cap=None, cost_cap=None):
     upper[IDX["bio"]] = biomass_max
     upper[IDX["gas"]] = GAS_MAX
     upper[IDX["wh"]] = waste_heat_avail
-    upper[IDX["solar"]] = solar_avail
+    upper[IDX["solar"]] = 0.80 * solar_avail
     upper[IDX["grid"]] = GRID_LIMIT
     upper[IDX["flex"]] = FLEX_MAX
 
@@ -475,14 +475,15 @@ def build_plan(x):
 # 6. SUBMITTED WORKFILE NORMAL DISPATCH
 # ============================================================
 # IMPORTANT:
-# The normal dispatch below is transcribed from the submitted
-# Chemitool/DHF13 workfile. It is deliberately kept separate
-# from the MILP optimizer so the simulator reproduces the
-# submitted figures exactly:
-#   CO2  = 842.944 tCO2e/day
-#   Cost = INR 5,099,750/day
-#   CO2 reduction = 14.59%
-#   Cost reduction = 7.73%
+# The normal dispatch starts from the submitted Chemitool/DHF13
+# workfile dispatch, but the live simulator now enforces the
+# problem-statement solar rule: only 80% of hourly available
+# solar can be used. The grid balances the remaining electricity.
+# Result for the fixed submitted dispatch after this correction:
+#   CO2  = 850.498 tCO2e/day
+#   Cost = INR 5,188,510/day
+#   CO2 reduction = 13.83%
+#   Cost reduction = 6.12%
 # ============================================================
 
 SUBMITTED_COAL = np.array([
@@ -535,15 +536,19 @@ def build_submitted_plan(demand_factor=1.0, electricity_factor=1.0):
     """
 
     # Workfile dispatch is scaled only for the optional 90-day
-    # projection. At 1.0 the values are exactly the submitted plan.
+    # projection. At 1.0 the fuel/steam values are the submitted plan;
+    # solar is always capped at 80% of available solar.
     coal = SUBMITTED_COAL * demand_factor
     bio = SUBMITTED_BIO * demand_factor
     gas = SUBMITTED_GAS * demand_factor
     wh = SUBMITTED_WH * demand_factor
 
-    solar = SUBMITTED_SOLAR * electricity_factor
-    grid = SUBMITTED_GRID * electricity_factor
+    # Problem statement: only 80% of available solar may be used.
+    solar = 0.80 * SUBMITTED_SOLAR * electricity_factor
+    # Grid is the balancing source after applying the 80% solar cap.
+    fixed_elec = fixed_electricity * electricity_factor
     flex = SUBMITTED_FLEX * electricity_factor
+    grid = fixed_elec + flex - solar
 
     steam_supply = coal + bio + gas + wh
     steam_error = steam_supply - (steam_demand * demand_factor)
@@ -588,7 +593,7 @@ def build_submitted_plan(demand_factor=1.0, electricity_factor=1.0):
         "Steam Error (t/h)": steam_error,
         "Solar Used (MW)": solar,
         "Grid Import (MW)": grid,
-        "Fixed Electricity (MW)": fixed_electricity * electricity_factor,
+        "Fixed Electricity (MW)": fixed_elec,
         "Flexible Load (MW)": flex,
         "Electricity Demand (MW)": electricity_demand,
         "Electricity Error (MW)": electricity_error,
@@ -695,6 +700,11 @@ def check_plan(df, resilience=False):
     ))
 
     checks.append((
+        "Solar used <= 80% of hourly available solar",
+        np.max(df["Solar Used (MW)"].to_numpy() - 0.80 * solar_availability) <= 1e-6
+    ))
+
+    checks.append((
         "Grid import <= 22 MW",
         df["Grid Import (MW)"].max() <= GRID_LIMIT + 1e-6
     ))
@@ -784,10 +794,11 @@ if mode == "90-Day Operational Plan":
             "Available solar electricity (MWh/day)",
             min_value=0.0, max_value=5000.0,
             value=REF_SOLAR, step=0.1,
-            help="Solar electricity available during the day."
+            help="Solar electricity available during the day. CarbonOS uses only 80% of this availability, as required by the problem statement."
         )
 
     st.info(
+        f"Solar rule: CarbonOS uses 80% of available solar. "
         f"Submitted-workfile reference values: {REF_STEAM:.0f} t/day steam | "
         f"{REF_ELECTRICITY:.1f} MWh/day electricity | "
         f"{REF_WASTE_HEAT:.0f} t/day waste heat | {REF_SOLAR:.1f} MWh/day solar."
@@ -806,7 +817,7 @@ if mode == "90-Day Operational Plan":
 
     # Apply exact plant-entered waste heat and solar quantities.
     day_df["Waste Heat (t/h)"] = SUBMITTED_WH * wh_factor
-    day_df["Solar Used (MW)"] = SUBMITTED_SOLAR * solar_factor
+    day_df["Solar Used (MW)"] = 0.80 * SUBMITTED_SOLAR * solar_factor
 
     # Recalculate steam balance.
     day_df["Steam Supply (t/h)"] = (
@@ -876,8 +887,14 @@ if mode == "90-Day Operational Plan":
         carbon_gate, cost_gate, steam_balanced,
         electricity_balanced, fuel_ok, grid_ok,
         day_df.loc[8:17, "Flexible Load (MW)"].min() >= 0.5 - 1e-6,
-        abs(day_df["Flexible Load (MW)"].sum() - 18.0) <= 1e-6
+        abs(day_df["Flexible Load (MW)"].sum() - 18.0) <= 1e-6,
+        np.max(day_df["Solar Used (MW)"].to_numpy() - 0.80 * SUBMITTED_SOLAR * solar_factor) <= 1e-6
     ])
+
+    st.caption(
+        f"Solar available: {daily_solar:,.2f} MWh/day → "
+        f"CarbonOS solar used: {0.80 * daily_solar:,.2f} MWh/day (80%)"
+    )
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Daily CO₂", f"{day_co2:,.3f} tCO₂e")
@@ -889,17 +906,18 @@ if mode == "90-Day Operational Plan":
     gate_table = pd.DataFrame({
         "Gate": [
             "Carbon reduction", "Cost reduction", "Hourly steam balance",
-            "Hourly electricity balance", "Fuel limits", "Grid limit",
+            "Hourly electricity balance", "Solar utilization", "Fuel limits", "Grid limit",
             "Flexible load continuity 08:00-18:00", "Flexible load energy"
         ],
         "Required": [
             "≥ 12%", "≥ 5%", "Demand ≤ supply ≤ 103%",
-            "Balanced", "Within limits", "≤ 22 MW", "≥ 0.5 MW in each hourly interval", "= 18 MWh/day"
+            "Balanced", "≤ 80% of available", "Within limits", "≤ 22 MW", "≥ 0.5 MW in each hourly interval", "= 18 MWh/day"
         ],
         "Achieved": [
             f"{day_carbon_reduction:.2f}%", f"{day_cost_reduction:.2f}%",
             "PASS" if steam_balanced else "FAIL",
             "PASS" if electricity_balanced else "FAIL",
+            f"{(day_df['Solar Used (MW)'].sum()/daily_solar*100) if daily_solar > 0 else 0:.1f}%",
             "PASS" if fuel_ok else "FAIL",
             f"{day_df['Grid Import (MW)'].max():.2f} MW",
             f"{day_df.loc[8:17, 'Flexible Load (MW)'].min():.2f} MW min",
@@ -910,6 +928,7 @@ if mode == "90-Day Operational Plan":
             "PASS" if cost_gate else "FAIL",
             "PASS" if steam_balanced else "FAIL",
             "PASS" if electricity_balanced else "FAIL",
+            "PASS" if (daily_solar == 0 or day_df["Solar Used (MW)"].sum() <= 0.80 * daily_solar + 1e-6) else "FAIL",
             "PASS" if fuel_ok else "FAIL",
             "PASS" if grid_ok else "FAIL",
             "PASS" if day_df.loc[8:17, "Flexible Load (MW)"].min() >= 0.5 - 1e-6 else "FAIL",
@@ -930,6 +949,8 @@ if mode == "90-Day Operational Plan":
             "Electricity Demand (MWh/day)": daily_electricity,
             "Waste Heat Available (t/day)": daily_waste_heat,
             "Solar Available (MWh/day)": daily_solar,
+            "Solar Used (MWh/day)": day_df["Solar Used (MW)"].sum(),
+            "Solar Utilization (%)": 80.0,
             "CO2 (tCO2e/day)": day_co2,
             "Cost (INR/day)": day_cost,
             "CO2 Reduction (%)": day_carbon_reduction,
@@ -1011,7 +1032,7 @@ st.divider()
 # ============================================================
 
 if mode == "Normal Operation":
-    st.subheader("📌 Submitted Workfile Validation")
+    st.subheader("📌 Submitted Workfile + 80% Solar Validation")
 
     submitted_co2 = normal["CO2"]
     submitted_cost = normal["Cost"]
@@ -1026,11 +1047,11 @@ if mode == "Normal Operation":
     validation_table = pd.DataFrame({
         "Metric": [
             "Official baseline CO₂",
-            "Submitted CarbonOS CO₂",
+            "CarbonOS CO₂ (80% solar cap)",
             "CO₂ reduction",
             "CO₂ gate",
             "Official baseline cost",
-            "Submitted CarbonOS cost",
+            "CarbonOS cost (80% solar cap)",
             "Cost reduction",
             "Cost gate"
         ],
@@ -1046,11 +1067,11 @@ if mode == "Normal Operation":
         ],
         "Status": [
             "REFERENCE",
-            "SUBMITTED",
+            "VALIDATED",
             "PASS" if submitted_carbon_reduction >= 12 else "FAIL",
             "",
             "REFERENCE",
-            "SUBMITTED",
+            "VALIDATED",
             "PASS" if submitted_cost_reduction >= 5 else "FAIL",
             "",
         ]
