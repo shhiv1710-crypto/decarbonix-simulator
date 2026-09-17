@@ -522,14 +522,51 @@ if mode == "90-Day Operational Plan":
         electricity_factor=electricity_factor
     )
 
-    day_df["Waste Heat (t/h)"] = SUBMITTED_WH * wh_factor
-    day_df["Solar Used (MW)"] = SUBMITTED_SOLAR * solar_factor  # up to 100%, no 0.8x
+    # --------------------------------------------------------
+    # Waste heat and solar are entered as their OWN independent
+    # daily quantities (per the caption above), so their factors
+    # will not generally equal steam_factor / electricity_factor.
+    # At steam_factor == wh_factor and electricity_factor ==
+    # solar_factor (true whenever every field is left at its
+    # reference default, i.e. Day 1 as submitted) the block below
+    # is a no-op and reproduces the submitted plan's totals
+    # exactly. Whenever the factors genuinely differ, it re-closes
+    # both balances instead of letting the mismatch between two
+    # independently-scaled quantities silently show up as a
+    # "steam imbalance" or "electricity imbalance" failure below.
+    # --------------------------------------------------------
+
+    new_wh = (SUBMITTED_WH * wh_factor).to_numpy() if hasattr(SUBMITTED_WH * wh_factor, "to_numpy") else np.asarray(SUBMITTED_WH * wh_factor)
+    new_demand = np.asarray(steam_demand * steam_factor)
+    coal_shape = day_df["Coal (t/h)"].to_numpy().copy()
+    bio_shape = day_df["Biomass (t/h)"].to_numpy().copy()
+    gas_shape = day_df["Gas (t/h)"].to_numpy().copy()
+
+    steam_gap = new_demand - (coal_shape + bio_shape + gas_shape + new_wh)
+
+    # Absorb the gap into coal first (its own 25-90 t/h range),
+    # then into gas (0-45 t/h) for whatever coal can't take.
+    coal_adj = np.clip(coal_shape + steam_gap, 0.0, COAL_MAX)
+    remaining_gap = steam_gap - (coal_adj - coal_shape)
+    gas_adj = np.clip(gas_shape + remaining_gap, 0.0, GAS_MAX)
+    remaining_gap = remaining_gap - (gas_adj - gas_shape)
+    # Last resort for an oversupply the above can't absorb
+    # (e.g. waste heat alone now exceeds demand): trim waste
+    # heat usage down to what's actually needed. Waste heat is
+    # opportunistic — using less than the stated availability
+    # is always allowed, unlike being short of demand.
+    wh_adj = np.where(remaining_gap < 0, np.maximum(new_wh + remaining_gap, 0.0), new_wh)
+
+    day_df["Coal (t/h)"] = coal_adj
+    day_df["Biomass (t/h)"] = bio_shape
+    day_df["Gas (t/h)"] = gas_adj
+    day_df["Waste Heat (t/h)"] = wh_adj
 
     day_df["Steam Supply (t/h)"] = (
         day_df["Coal (t/h)"] + day_df["Biomass (t/h)"] +
         day_df["Gas (t/h)"] + day_df["Waste Heat (t/h)"]
     )
-    day_df["Steam Demand (t/h)"] = steam_demand * steam_factor
+    day_df["Steam Demand (t/h)"] = new_demand
     day_df["Steam Error (t/h)"] = (
         day_df["Steam Supply (t/h)"] - day_df["Steam Demand (t/h)"]
     )
@@ -539,8 +576,14 @@ if mode == "90-Day Operational Plan":
     day_df["Electricity Demand (MW)"] = (
         day_df["Fixed Electricity (MW)"] + day_df["Flexible Load (MW)"]
     )
-    day_df["Grid Import (MW)"] = np.maximum(
-        day_df["Electricity Demand (MW)"] - day_df["Solar Used (MW)"], 0.0
+    # Solar is capped at that hour's demand — export isn't allowed,
+    # so entering more solar than the day can use simply curtails
+    # the excess instead of creating an oversupply "error".
+    day_df["Solar Used (MW)"] = np.minimum(
+        SUBMITTED_SOLAR * solar_factor, day_df["Electricity Demand (MW)"]
+    )
+    day_df["Grid Import (MW)"] = (
+        day_df["Electricity Demand (MW)"] - day_df["Solar Used (MW)"]
     )
     day_df["Electricity Error (MW)"] = (
         day_df["Solar Used (MW)"] + day_df["Grid Import (MW)"] -
@@ -685,7 +728,7 @@ if mode == "90-Day Operational Plan":
         st.dataframe(records_df, use_container_width=True, hide_index=True)
         st.download_button(
             "⬇️ Download 90-Day Plan CSV",
-            records_df.to_csv(index=False),
+            records_df.round(3).to_csv(index=False),
             "CarbonOS_90_Day_Operational_Plan.csv",
             "text/csv"
         )
@@ -717,16 +760,38 @@ cost_improvement = 100 * (BASELINE_COST - active["Cost"]) / BASELINE_COST
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("24-h CO₂", f"{active['CO2']:.2f} tCO₂e")
 c2.metric("24-h Variable Cost", f"₹{active['Cost']:,.0f}")
-c3.metric("CO₂ vs Official Baseline", f"{carbon_improvement:.2f}%")
-c4.metric("Cost vs Official Baseline", f"{cost_improvement:.2f}%")
 
 if mode == "Normal Operation":
+    # Section 3 of the brief: Normal Operation IS graded against the
+    # official baseline (>=12% carbon, >=5% cost), so that comparison
+    # is the correct headline here.
+    c3.metric("CO₂ vs Official Baseline", f"{carbon_improvement:.2f}%")
+    c4.metric("Cost vs Official Baseline", f"{cost_improvement:.2f}%")
+
     gate1 = active["CO2"] <= 0.88 * BASELINE_CO2 + 1e-6
     gate2 = active["Cost"] <= 0.95 * BASELINE_COST + 1e-6
     if gate1 and gate2:
         st.success("✅ Normal-case 12% CO₂ and 5% cost gates are satisfied.")
     else:
         st.error("❌ A normal-case 12% CO₂ or 5% cost gate is not satisfied.")
+else:
+    # Section 3 / Section 8 of the brief: the resilience case carries
+    # "no fixed improvement threshold" and must instead "quantify the
+    # change in emissions and variable cost relative to the team's
+    # own normal operating plan." That is the comparison the jury will
+    # actually check here, so it — not the baseline — is the headline.
+    dE = active["CO2"] - normal["CO2"]
+    dC = active["Cost"] - normal["Cost"]
+    c3.metric("ΔCO₂ vs your normal plan", f"{dE:+.2f} tCO₂e", f"{100*dE/normal['CO2']:+.2f}%")
+    c4.metric("ΔCost vs your normal plan", f"₹{dC:+,.0f}", f"{100*dC/normal['Cost']:+.2f}%")
+    st.caption(
+        "The brief sets no fixed carbon/cost gate for the resilience case (Section 3) — "
+        "it only requires feasibility, and asks for the degradation to be quantified "
+        "against your own normal plan, not the official baseline (Section 8). The "
+        "figures above are that required comparison. For context only, this plan "
+        f"still sits {carbon_improvement:.2f}% below the baseline on carbon and "
+        f"{cost_improvement:.2f}% below it on cost."
+    )
 
 st.divider()
 
@@ -950,7 +1015,7 @@ st.write(
 # ============================================================
 
 st.subheader("📥 Simulation Data")
-csv_data = active_df.to_csv(index=False)
+csv_data = active_df.round(3).to_csv(index=False)
 st.download_button(
     "Download 24-hour CarbonOS CSV", csv_data, "CarbonOS_24h_dispatch.csv", "text/csv"
 )
